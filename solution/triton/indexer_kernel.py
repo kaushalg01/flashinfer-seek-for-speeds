@@ -187,16 +187,16 @@ def indexer_kernel(
         q_ptrs = (
             q_index_fp8
             + batch_id * num_index_heads * index_head_dim
-            + h_ids[:, None] * index_head_dim
-            + offs_d[None, :]
+            + offs_d[:, None]                        # dim is now primary
+            + h_ids[None, :] * index_head_dim
         )
 
         q_block = t1.load(
             q_ptrs,
-            mask=(h_ids[:, None] < num_index_heads),
+            mask=(offs_d[:, None] < index_head_dim) & (h_ids[None, :] < num_index_heads),
             other=0.0
-        )  # [BLOCK_HEADS, head_dim]
-
+        )
+        q_block = t1.trans(q_block) # this is just for correcting math
     # ---------------------------------------------
     # LOAD WEIGHTS [BLOCK_HEADS]
     # ---------------------------------------------
@@ -215,8 +215,10 @@ def indexer_kernel(
     # q_block: [BLOCK_HEADS, dim]
 
     # broadcast multiply → [BLOCK_HEADS, BLOCK_TOKENS]
+        # q_block is now [dim, heads]
+
         scores = t1.sum(
-            q_block[:, None, :] * k_vals[None, :, :],
+            q_block[None, :, :] * k_vals[:, None, :],
             axis=2
         )
 
@@ -224,7 +226,9 @@ def indexer_kernel(
         scores = t1.maximum(scores, 0.0)
 
     # apply weights
-        scores = scores * w_block[:, None]
+        # scores = scores * w_block[:, None]
+        scores = scores * w_block[None, :] 
+        # please check which one works better and is better
 
     # reduce across heads
         token_scores += t1.sum(scores, axis=0)
@@ -450,4 +454,3 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
         output[t] = out.to(torch.bfloat16)
 
     return output, lse
-
