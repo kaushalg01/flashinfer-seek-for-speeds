@@ -109,7 +109,6 @@ cale : float
         batch_size=batch_size,
         num_index_heads=num_index_heads,
         index_head_dim=index_head_dim,
-        num_pages=num_pages,
         page_size=page_size,
         kv_cache_num_heads=kv_cache_num_heads,
         head_dim_with_scale=head_dim_with_scale,
