@@ -253,7 +253,7 @@ def topk_kernel(
     K,
 
     BLOCK_TOKENS: t1.constexpr,
-    MAX_K: t1.constexpr,
+    MAX_K: t1.constexpr
 ):
     batch_id = t1.program_id(0)
 
@@ -318,8 +318,8 @@ def run_indexer_and_topk(
     max_num_pages,
     topk,
     BLOCK_TOKENS=32,
-    BLOCK_HEADS=8
-    device='cuda',
+    BLOCK_HEADS=8,
+    device='cuda'
 ):
 
     # -------------------------------------------------------

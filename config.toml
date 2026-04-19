@@ -1,8 +1,8 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "TheRealDoers_V1"      # Solution name
+definition = "sparse_attention"          # Track: fused_moe | sparse_attention | gated_delta_net
+author = "TheRealDoers"              # Team/author name
 
 [build]
 language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+entry_point = "kernel.py::run_sparse_attention_pipeline"  # Kernel function name
