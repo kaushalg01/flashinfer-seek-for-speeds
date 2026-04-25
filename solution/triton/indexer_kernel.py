@@ -3,304 +3,344 @@ import triton
 import triton.language as t1
 @triton.jit
 
+
 def indexer_kernel(
-    q_index_fp8,           # [batch_size, num_index_heads, index_head_dim] fp8
-    k_index_cache_fp8,     # [num_pages * page_size * head_dim_with_scale] fp8
-    weights,               # [batch_size, num_index_heads] float32
-    seq_lens,              # [batch_size] int32
-    block_table,           # [batch_size, max_num_pages] int32
-    seq_offsets,           # [batch_size] int32, cumulative sum of seq_lens
-    tile_offsets_ptr,      # cumulative tile offsets (pid → batch mapping)
+   q_index_fp8,           # [batch_size, num_index_heads, index_head_dim] fp16
+   k_index_cache_fp8,     # [num_pages * page_size * head_dim_with_scale] int8
+   weights,               # [batch_size, num_index_heads] float32
+   seq_lens,              # [batch_size] int32
+   block_table,           # [batch_size, max_num_pages] int32
+   seq_offsets,           # [batch_size] int32, cumulative sum of seq_lens
+   tile_offsets_ptr,      # cumulative tile offsets (pid ’ batch mapping)
 
-    acc_ptr,
-    batch_size,
-    num_index_heads,
-    index_head_dim,
-    page_size,
-    kv_cache_num_heads,
-    head_dim_with_scale,
-    max_num_pages,
 
-    BLOCK_TOKENS: t1.constexpr,
-    BLOCK_HEADS: t1.constexpr
+   acc_ptr,
+   batch_size: t1.constexpr, # Declared as constexpr
+   num_index_heads: t1.constexpr,
+   index_head_dim: t1.constexpr,
+   page_size: t1.constexpr,
+   kv_cache_num_heads: t1.constexpr,
+   head_dim_with_scale: t1.constexpr,
+   max_num_pages: t1.constexpr,
+
+
+   BLOCK_TOKENS: t1.constexpr,
+   BLOCK_HEADS: t1.constexpr
 ):
 
-    # Each program processes a tile of tokens for a given sequence (batch element),
-    # instead of splitting work across heads.
 
-    # We divide the KV cache into pages and further into token tiles.
-    # For each program:
-    #   - it owns a BLOCK_TOKENS chunk of tokens for one sequence
-    #   - it computes the final score for those tokens across ALL heads
+   # Each program processes a tile of tokens for a given sequence (batch element),
+   # instead of splitting work across heads.
 
-    # Execution flow:
-    # 1. Map program_id → (batch_id, token_tile_id) using tile_offsets
-    # 2. For the given sequence:
-    #    - fetch its KV cache pages using block_table
-    # 3. Load a tile of K (for the current token tile)
-    #    - dequantize FP8 values using per-token scales
-    # 4. For each head:
-    #    - load corresponding Q vector
-    #    - compute dot(Q, K_tile) → scores per token
-    #    - apply activation (ReLU) and head-specific weights
-    #    - accumulate into token_scores
 
-    # Key design decisions:
-    # - Parallelism is across tokens (not heads)
-    # - Each token is processed by exact1y one program → Earlier, each program was handling some BLOCK_HEADS and writing result per token in a register
-    #   This writing was atomic and was causing serialisation of programs, breaking parallelism
-    # - K tiles are loaded once per page and reused across all heads (improves memory efficiency)
-    # - Q is reloaded per head (acceptable since Q is small compared to K)
+   # We divide the KV cache into pages and further into token tiles.
+   # For each program:
+   #   - it owns a BLOCK_TOKENS chunk of tokens for one sequence
+   #   - it computes the final score for those tokens across ALL heads
 
-    # Total programs launched:
-    #   sum_over_batch ceil(seq_len / BLOCK_TOKENS)
 
-    # This design:
-    #   - eliminates contention from atomic adds (against earlier implementation)
-    #   - improves effective memory bandwidth usage
-    #   - maintains good reuse of K across heads within a program
+   # Execution flow:
+   # 1. Map program_id ’ (batch_id, token_tile_id) using tile_offsets
+   # 2. For the given sequence:
+   #    - fetch its KV cache pages using block_table
+   # 3. Load a tile of K (for the current token tile)
+   #    - dequantize FP8 values using per-token scales
+   # 4. For each head:
+   #    - load corresponding Q vector
+   #    - compute dot(Q, K_tile) ’ scores per token
+   #    - apply activation (ReLU) and head-specific weights
+   #    - accumulate into token_scores
 
-    # Conceptual layout:
-    #
-    # For each sequence:
-    #   tokens → split across programs
-    #   heads  → processed inside each program (reduction dimension)
-    #
-    #        head_id
-    #      0   1   2
-    # token
-    # 0    h0  h1  h2
-    # 1    h3  h4  h5
-    # 2    h6  h7  h8
-    #
-    # Each program handles a vertical slice (tokens),
-    # and reduces across all heads locally.
 
-    # -------------------------------------------------------
-    # PROGRAM MAPPING
-    # program = (batch_id, token_tile)
-    # -------------------------------------------------------
-    pid = t1.program_id(0)
+   # Key design decisions:
+   # - Parallelism is across tokens (not heads)
+   # - Each token is processed by exact1y one program ’ Earlier, each program was handling some BLOCK_HEADS and writing result per token in a register
+   #   This writing was atomic and was causing serialisation of programs, breaking parallelism
+   # - K tiles are loaded once per page and reused across all heads (improves memory efficiency)
+   # - Q is reloaded per head (acceptable since Q is small compared to K)
 
-    # -------------------------------------------------------
-    # FIND batch_id USING tile_offsets
-    # -------------------------------------------------------
-    # -------------------------------------------------------
-    # PROGRAM MAPPING: pid → (batch_id, token_tile)
-    # -------------------------------------------------------
 
-    batch_id = 0
-    for b in range(batch_size):
-        if pid < t1.load(tile_offsets_ptr + b):
-            batch_id = b
-            break
+   # Total programs launched:
+   #   sum_over_batch ceil(seq_len / BLOCK_TOKENS)
 
-    prev_offset = t1.where(
-        batch_id > 0,
-        t1.load(tile_offsets_ptr + batch_id - 1),
-        0
-    )
 
-    token_tile_id = pid - prev_offset
+   # This design:
+   #   - eliminates contention from atomic adds (against earlier implementation)
+   #   - improves effective memory bandwidth usage
+   #   - maintains good reuse of K across heads within a program
 
-    # -------------------------------------------------------
-    # LOAD SEQUENCE METADATA
-    # -------------------------------------------------------
-    seq_len = t1.load(seq_lens + batch_id)
-    seq_start = t1.load(seq_offsets + batch_id)
 
-    # -------------------------------------------------------
-    # PAGE-ALIGNED TOKEN TILE
-    # -------------------------------------------------------
-    token_start = token_tile_id * BLOCK_TOKENS
+   # Conceptual layout:
+   #
+   # For each sequence:
+   #   tokens ’ split across programs
+   #   heads  ’ processed inside each program (reduction dimension)
+   #
+   #        head_id
+   #      0   1   2
+   # token
+   # 0    h0  h1  h2
+   # 1    h3  h4  h5
+   # 2    h6  h7  h8
+   #
+   # Each program handles a vertical slice (tokens),
+   # and reduces across all heads locally.
 
-    # compute page id for this tile
-    page_id = token_start // page_size
-    offset_in_page = token_start % page_size
 
-    # clamp so tile does not cross page
-    tokens_left_in_page = page_size - offset_in_page
-    effective_tokens = t1.minimum(BLOCK_TOKENS, tokens_left_in_page)
+   # -------------------------------------------------------
+   # PROGRAM MAPPING
+   # program = (batch_id, token_tile)
+   # -------------------------------------------------------
+   pid = t1.program_id(0)
 
-    offs_t = t1.arange(0, BLOCK_TOKENS)
-    offset_token = token_start + offs_t
 
-    token_mask = offset_token < (token_start + effective_tokens)
-    token_mask &= offset_token < seq_len
+   # -------------------------------------------------------
+   # FIND batch_id USING tile_offsets
+   # -------------------------------------------------------
+   # -------------------------------------------------------
+   # PROGRAM MAPPING: pid ’ (batch_id, token_tile)
+   # -------------------------------------------------------
 
-    offs_d = t1.arange(0, index_head_dim)
 
-    # -------------------------------------------------------
-    # FETCH PAGE POINTER (ONLY ONE PAGE)
-    # -------------------------------------------------------
-    page_index = t1.load(
-        block_table + batch_id * max_num_pages + page_id
-    )
+   # Determine batch_id without using 'break'
+   # Find the first batch where pid is less than its tile_offset
+   # This effectively means finding the index 'b' where tile_offsets_ptr[b-1] <= pid < tile_offsets_ptr[b]
+   batch_id = t1.sum(t1.cast(pid >= t1.load(tile_offsets_ptr + t1.arange(0, batch_size)), t1.int32))
 
-    k_page_ptr = k_index_cache_fp8 + (
-        page_index * page_size * head_dim_with_scale * kv_cache_num_heads
-    )
 
-    # -------------------------------------------------------
-    # LOAD K TILE
-    # -------------------------------------------------------
-    k_ptrs = (
-        k_page_ptr
-        + (offset_in_page + offs_t)[:, None] * head_dim_with_scale
-        + offs_d[None, :]
-    )
+   prev_offset = t1.where(
+       batch_id > 0,
+       t1.load(tile_offsets_ptr + batch_id - 1),
+       0
+   )
 
-    k_tile = t1.load(
-        k_ptrs,
-        mask=token_mask[:, None],
-        other=0.0
-    )
 
-    scale_ptrs = (
-        k_page_ptr
-        + (offset_in_page + offs_t) * head_dim_with_scale
-        + index_head_dim
-    )
+   token_tile_id = pid - prev_offset
 
-    scale_vals = t1.load(
-        scale_ptrs,
-        mask=token_mask,
-        other=0.0
-    )
 
-    # dequantize
-    k_vals = k_tile.to(t1.float16) * scale_vals[:, None]
+   # -------------------------------------------------------
+   # LOAD SEQUENCE METADATA
+   # -------------------------------------------------------
+   seq_len = t1.load(seq_lens + batch_id)
+   seq_start = t1.load(seq_offsets + batch_id)
 
-    # -------------------------------------------------------
-    # ACCUMULATE ACROSS HEADS (REDUCTION INSIDE PROGRAM)
-    # -------------------------------------------------------
-    token_scores = t1.zeros([BLOCK_TOKENS], t1.float32)
 
-    for h_block in range(0, num_index_heads, BLOCK_HEADS):
+   # -------------------------------------------------------
+   # PAGE-ALIGNED TOKEN TILE
+   # -------------------------------------------------------
+   token_start = token_tile_id * BLOCK_TOKENS
 
-    # ---------------------------------------------
-    # LOAD Q BLOCK [BLOCK_HEADS, head_dim]
-    # ---------------------------------------------
-        offs_h = t1.arange(0, BLOCK_HEADS)
-        h_ids = h_block + offs_h
 
-        q_ptrs = (
-            q_index_fp8
-            + batch_id * num_index_heads * index_head_dim
-            + offs_d[:, None]                        # dim is now primary
-            + h_ids[None, :] * index_head_dim
-        )
+   # compute page id for this tile
+   page_id = token_start // page_size
+   offset_in_page = token_start % page_size
 
-        q_block = t1.load(
-            q_ptrs,
-            mask=(offs_d[:, None] < index_head_dim) & (h_ids[None, :] < num_index_heads),
-            other=0.0
-        )
-        q_block = t1.trans(q_block) # this is just for correcting math
-    # ---------------------------------------------
-    # LOAD WEIGHTS [BLOCK_HEADS]
-    # ---------------------------------------------
-        w_ptrs = weights + batch_id * num_index_heads + h_ids
 
-        w_block = t1.load(
-            w_ptrs,
-            mask=h_ids < num_index_heads,
-            other=0.0
-        )
+   # clamp so tile does not cross page
+   tokens_left_in_page = page_size - offset_in_page
+   effective_tokens = t1.minimum(BLOCK_TOKENS, tokens_left_in_page)
 
-    # ---------------------------------------------
-    # COMPUTE: [tokens, dim] × [heads, dim]
-    # ---------------------------------------------
-    # k_vals: [BLOCK_TOKENS, dim]
-    # q_block: [BLOCK_HEADS, dim]
 
-    # broadcast multiply → [BLOCK_HEADS, BLOCK_TOKENS]
-        # q_block is now [dim, heads]
+   offs_t = t1.arange(0, BLOCK_TOKENS)
+   offset_token = token_start + offs_t
 
-        scores = t1.sum(
-            q_block[None, :, :] * k_vals[:, None, :],
-            axis=2
-        )
 
-    # activation
-        scores = t1.maximum(scores, 0.0)
+   token_mask = offset_token < (token_start + effective_tokens)
+   token_mask &= offset_token < seq_len
 
-    # apply weights
-        # scores = scores * w_block[:, None]
-        scores = scores * w_block[None, :] 
-        # please check which one works better and is better
 
-    # reduce across heads
-        token_scores += t1.sum(scores, axis=0)
+   offs_d = t1.arange(0, index_head_dim)
 
-    # global token indices
-    global_token_ids = seq_start + offset_token
-    
-    # store results
-    t1.store(
-        acc_ptr + global_token_ids,
-        token_scores,
-        mask=token_mask
-    )
 
+   # -------------------------------------------------------
+   # FETCH PAGE POINTER (ONLY ONE PAGE)
+   # -------------------------------------------------------
+   page_index = t1.load(
+       block_table + batch_id * max_num_pages + page_id
+   )
+
+
+   k_page_ptr = k_index_cache_fp8 + (
+       page_index * page_size * head_dim_with_scale * kv_cache_num_heads
+   )
+
+
+   # -------------------------------------------------------
+   # LOAD K TILE
+   # -------------------------------------------------------
+   k_ptrs = (
+       k_page_ptr
+       + (offset_in_page + offs_t)[:, None] * head_dim_with_scale
+       + offs_d[None, :]
+   )
+
+
+   k_tile = t1.load(
+       k_ptrs,
+       mask=token_mask[:, None],
+       other=0
+   )
+
+
+   # Dummy fetch scale (not used for dequantization in FP16)
+   scale_ptrs = (
+       k_page_ptr
+       + (offset_in_page + offs_t) * head_dim_with_scale
+       + index_head_dim
+   )
+
+
+   scale_vals = t1.load(
+       scale_ptrs,
+       mask=token_mask,
+       other=0.0
+   )
+
+
+   # Dequantize FP8 values using per-token scales
+   k_vals = k_tile.to(t1.float16) * scale_vals[:, None]
+
+
+   # -------------------------------------------------------
+   # ACCUMULATE ACROSS HEADS (REDUCTION INSIDE PROGRAM)
+   # -------------------------------------------------------
+   token_scores = t1.zeros([BLOCK_TOKENS], t1.float32)
+
+
+   for h_block in t1.static_range(num_index_heads // BLOCK_HEADS):
+
+
+   # ---------------------------------------------
+   # LOAD Q BLOCK [BLOCK_HEADS, head_dim]
+   # ---------------------------------------------
+       offs_h = t1.arange(0, BLOCK_HEADS)
+       h_ids = h_block * BLOCK_HEADS + offs_h
+
+
+       q_ptrs = (
+           q_index_fp8
+           + batch_id * num_index_heads * index_head_dim
+           + offs_d[:, None]                        # dim is now primary
+           + h_ids[None, :] * index_head_dim
+       )
+
+
+       q_block = t1.load(
+           q_ptrs,
+           mask=(offs_d[:, None] < index_head_dim) & (h_ids[None, :] < num_index_heads),
+           other=0.0
+       )
+       q_block = t1.trans(q_block) # this is just for correcting math
+   # ---------------------------------------------
+   # LOAD WEIGHTS [BLOCK_HEADS]
+   # ---------------------------------------------
+       w_ptrs = weights + batch_id * num_index_heads + h_ids
+
+
+       w_block = t1.load(
+           w_ptrs,
+           mask=h_ids < num_index_heads,
+           other=0.0
+       )
+
+
+   # ---------------------------------------------
+   # COMPUTE: [tokens, dim]   [heads, dim]
+   # ---------------------------------------------
+   # k_vals: [BLOCK_TOKENS, dim]
+   # q_block: [BLOCK_HEADS, dim]
+
+
+   # broadcast multiply ’ [BLOCK_HEADS, BLOCK_TOKENS]
+       # q_block is now [dim, heads]
+
+
+       scores = t1.sum(
+           q_block[None, :, :] * k_vals[:, None, :],
+           axis=2
+       )
+
+
+   # activation
+       scores = t1.maximum(scores, 0.0)
+
+
+   # apply weights
+       # scores = scores * w_block[:, None]
+       scores = scores * w_block[None, :]
+       # please check which one works better and is better
+
+
+   # reduce across heads
+       token_scores += t1.sum(scores, axis=1)
+
+
+   # global token indices
+   global_token_ids = seq_start + offset_token
+
+
+   # store results
+   t1.store(
+       acc_ptr + global_token_ids,
+       token_scores,
+       mask=token_mask
+   )
 
 @triton.jit
 def topk_kernel(
-    acc_ptr,
-    seq_offsets,
-    seq_lens,
-    topk_indices_ptr,
-    K,
-
-    BLOCK_TOKENS: t1.constexpr,
-    MAX_K: t1.constexpr
+   acc_ptr,
+   seq_offsets,
+   seq_lens,
+   topk_indices_ptr,
+   K: t1.constexpr,
+   MAX_K: t1.constexpr,
+   BLOCK: t1.constexpr,
+   MAX_SEQ_LEN: t1.constexpr
 ):
     batch_id = t1.program_id(0)
 
     seq_start = t1.load(seq_offsets + batch_id)
     seq_len   = t1.load(seq_lens + batch_id)
 
-    # running topK buffers (registers)
-    top_scores  = t1.full([MAX_K], -1e9, t1.float32)
-    top_indices = t1.zeros([MAX_K], t1.int32)
+    offs_block = t1.arange(0, BLOCK)
+    offs_k     = t1.arange(0, K)
 
-    for token_start in range(0, seq_len, BLOCK_TOKENS):
+    # init
+    top_scores  = t1.full((K,), -1e9, dtype=t1.float32)
+    top_indices = t1.full((K,), -1,   dtype=t1.int32)
 
-        offs = token_start + t1.arange(0, BLOCK_TOKENS)
+    for start in t1.static_range(0, MAX_SEQ_LEN, BLOCK):
+        offs = start + offs_block
         mask = offs < seq_len
 
-        # load from acc_ptr
-        scores = t1.load(
-            acc_ptr + seq_start + offs,
-            mask=mask,
-            other=-1e9,
-        )
+        vals = t1.load(acc_ptr + seq_start + offs, mask=mask, other=-1e9)
+        ids  = (seq_start + offs).to(t1.int32)
 
-        global_ids = seq_start + offs
+        # process BLOCK elements one-by-one (mask extraction)
+        for i in range(BLOCK):
+            lane = offs_block == i
 
-        # merge candidates
-        merged_scores = t1.zeros([2 * MAX_K], t1.float32)
-        merged_indices = t1.zeros([2 * MAX_K], t1.int32)
+            v = t1.sum(t1.where(lane, vals, 0.0), axis=0)
+            idx = t1.sum(t1.where(lane, ids, 0), axis=0)
 
-        merged_scores[:MAX_K] = top_scores
-        merged_scores[MAX_K:] = scores
+            valid = t1.sum(t1.where(lane, mask.to(t1.int32), 0), axis=0) > 0
 
-        merged_indices[:MAX_K] = top_indices
-        merged_indices[MAX_K:] = global_ids
+            # ---- core trick ----
+            # find smallest in top-k
+            min_val = t1.min(top_scores, axis=0)
 
-        # sort
-        order = t1.argsort(merged_scores, descending=True)
+            # check if new value should enter top-k
+            cond = valid & (v > min_val)
 
-        top_scores  = merged_scores[order[:K]]
-        top_indices = merged_indices[order[:K]]
+            # replace the min element
+            is_min = top_scores == min_val
 
-    # store results
-    offs_k = t1.arange(0, K)
+            top_scores = t1.where(cond & is_min, v, top_scores)
+            top_indices = t1.where(cond & is_min, idx, top_indices)
 
-    t1.store(
-        topk_indices_ptr + batch_id * K + offs_k,
-        top_indices,
-    )
+    # store result
+    out_offs = batch_id * K + t1.arange(0, K)
+    t1.store(topk_indices_ptr + out_offs, top_indices)
 
 def run_indexer_and_topk(
     q_index_fp8,
@@ -341,6 +381,7 @@ def run_indexer_and_topk(
     # STEP 2: launch indexer kernel
     # -------------------------------------------------------
     grid = (total_tiles,)
+    MAX_SEQ_LEN:t1.constexpr = int(seq_lens.max().item())
 
     indexer_kernel[grid](
         q_index_fp8=q_index_fp8,
@@ -384,8 +425,8 @@ def run_indexer_and_topk(
         seq_lens=seq_lens,
         topk_indices_ptr=topk_indices,
         K=topk,
-
-        BLOCK_TOKENS=BLOCK_TOKENS,
+        MAX_SEQ_LEN=MAX_SEQ_LEN,
+        BLOCK=16,
         MAX_K=topk,   # static upper bound
     )
 
